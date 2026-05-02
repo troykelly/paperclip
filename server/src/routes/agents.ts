@@ -2966,6 +2966,75 @@ export function agentRoutes(
     res.json(run);
   });
 
+  router.post("/agents/:agentId/runs/:runId/terminate", async (req, res) => {
+    const agentId = req.params.agentId as string;
+    const runId = req.params.runId as string;
+
+    const targetAgent = await svc.getById(agentId);
+    if (!targetAgent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, targetAgent.companyId);
+
+    const run = await heartbeat.getRun(runId);
+    if (!run) {
+      res.status(404).json({ error: "Heartbeat run not found" });
+      return;
+    }
+    if (run.agentId !== agentId) {
+      res.status(404).json({ error: "Run does not belong to this agent" });
+      return;
+    }
+
+    // Authorization: board users OR managers in the agent's chain of command.
+    // An agent cannot terminate its own run (prevents self-abort abuse).
+    if (req.actor.type === "board") {
+      await assertBoardCanManageAgentsForCompany(req, targetAgent.companyId);
+    } else if (req.actor.type === "agent") {
+      const callerAgentId = req.actor.agentId;
+      if (!callerAgentId) {
+        res.status(403).json({ error: "Agent authentication required" });
+        return;
+      }
+      if (callerAgentId === agentId) {
+        res.status(403).json({ error: "An agent cannot terminate its own run" });
+        return;
+      }
+      const chain = await svc.getChainOfCommand(agentId);
+      if (!chain.some((manager) => manager.id === callerAgentId)) {
+        res.status(403).json({ error: "Only managers of this agent can terminate its runs" });
+        return;
+      }
+    } else {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+
+    const reason = typeof req.body?.reason === "string"
+      ? req.body.reason.slice(0, 1000)
+      : "Terminated by manager";
+
+    const callerAgentId = req.actor.type === "agent" ? (req.actor.agentId ?? null) : null;
+    const terminated = await heartbeat.terminateRun(runId, reason, { callerAgentId });
+
+    if (terminated) {
+      await logActivity(db, {
+        companyId: targetAgent.companyId,
+        actorType: req.actor.type === "board" ? "user" : "agent",
+        actorId: req.actor.type === "board"
+          ? (req.actor.userId ?? "board")
+          : (req.actor.agentId ?? "unknown"),
+        action: "heartbeat.terminated_by_manager",
+        entityType: "heartbeat_run",
+        entityId: runId,
+        details: { agentId, reason },
+      });
+    }
+
+    res.json(terminated);
+  });
+
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {
     const runId = req.params.runId as string;
     const existing = await heartbeat.getRun(runId);

@@ -361,9 +361,64 @@ The recovery model is intentionally conservative:
 
 For a board operator, the intended meaning is:
 
-- agent-owned `in_progress` should mean \"this is live work or clearly surfaced as a problem\"
+- agent-owned `in_progress` should mean "this is live work or clearly surfaced as a problem"
 - agent-owned `todo` should not stay assigned forever after a crash with no remaining wake path
 - parent/sub-issue explains structure
 - blockers explain waiting
 
 That is the execution contract Paperclip should present to operators.
+
+## 14. Process Liveness Contract
+
+This section defines the invariants governing how Paperclip tracks and terminates agent processes.
+
+### Process Identity vs Process Existence
+
+A process is considered **alive** only when both of the following hold:
+
+1. The pid responds to `process.kill(pid, 0)` (process exists).
+2. The process group associated with that pid is also alive: `process.kill(-pgid, 0)` returns true.
+
+Condition 1 alone is **not sufficient**. A pid that passes the existence check may belong to an entirely different process that reused the same pid number after the original agent process died. This is the **pid-reuse failure mode**.
+
+Locally-spawned agent processes are launched with `detached: true`, making them their own process group leaders. Therefore `processGroupId == processPid` at spawn time. If a pid is alive but its process group is gone, the scheduler treats this as confirmed process loss — not as a live agent.
+
+### Handle Loss and Re-Verification
+
+When the in-memory process handle is lost (the `runningProcesses` map no longer contains a run that is still in `running` state), the scheduler enters handle-loss mode:
+
+- On each `reapOrphanedRuns` tick (fired at `heartbeatSchedulerIntervalMs` ≤ 60s), the scheduler re-checks both `isProcessAlive(pid)` and `isProcessGroupAlive(pgid)`.
+- If pid is alive **and** group is alive: the run is marked `process_detached` (warning, not terminal) and the tick is skipped.
+- If pid is alive **but** group is gone: **pid-reuse detected** — the run is marked `failed` with `errorCode: process_lost` and a `pidReuseDetected: true` lifecycle event. No retry is scheduled for pid-reuse cases.
+- If pid is gone and group is gone: normal process-loss handling; one retry may be scheduled.
+
+### Run Termination
+
+A run may be terminated by a manager (any agent in the subject agent's chain of command, or a board user) via:
+
+```
+POST /api/agents/:agentId/runs/:runId/terminate
+```
+
+Authorization rules:
+- Board users: always allowed.
+- Agent callers: must appear in the subject agent's `chainOfCommand`; the subject agent itself may not terminate its own run.
+- Idempotent: if the run is already in a terminal state, the endpoint returns it without error.
+
+On termination:
+- The process is killed (SIGTERM → grace → SIGKILL).
+- Run status is set to `failed` with `errorCode: terminated_by_manager`.
+- `releaseIssueExecutionAndPromote` is called, enabling the next heartbeat to fire immediately.
+- A `heartbeat.terminated_by_manager` activity log entry is written.
+
+### Watchdog Auto-Termination
+
+The output-silence watchdog (`scanSilentActiveRuns`) escalates stale runs through two levels:
+
+| Level | Silence duration | Process confirmed dead | Action |
+|-------|-----------------|----------------------|--------|
+| `suspicious` | > 1 hour | any | Create/maintain review issue (existing behavior) |
+| `critical` | > 4 hours | no (process alive) | Create/maintain review issue (existing behavior) |
+| `critical` | > 4 hours | yes (pid-reuse or gone) | **Auto-terminate** — no review issue created |
+
+Auto-termination at critical level with confirmed process death breaks the watchdog loop that previously created unbounded review issues for zombie runs. Human review issues are reserved for cases where the process is genuinely alive but silent.

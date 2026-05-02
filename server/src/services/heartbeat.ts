@@ -2175,7 +2175,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    terminateConfirmedDeadRun: (runId, reason) => terminateRunInternal(runId, reason),
+  });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
 
@@ -4600,7 +4603,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
-      if (processPidAlive) {
+
+      // Pid-identity verification: a spawned child becomes its own process group leader, so
+      // processGroupId == processPid. If the pid is alive but the process group is gone, the
+      // pid number was reused by an unrelated process — treat this as confirmed process loss.
+      const pidReuseDetected = Boolean(processPidAlive && run.processGroupId && !processGroupAlive);
+
+      if (processPidAlive && !pidReuseDetected) {
+        // Pid is alive and identity checks out (group is alive or no group to verify against).
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
@@ -4631,8 +4641,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // Do not retry pid-reuse cases — the original process is gone and a retry would
+      // start a fresh run, which releaseIssueExecutionAndPromote already arranges.
+      const shouldRetry = !pidReuseDetected && tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const baseMessage = pidReuseDetected
+        ? `Pid identity mismatch — pid ${run.processPid} is alive but process group ${run.processGroupId} is gone; pid was reused by another process`
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
@@ -4684,6 +4698,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
+          ...(pidReuseDetected ? { pidReuseDetected: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
         },
       });
@@ -7435,6 +7450,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  async function terminateRunInternal(
+    runId: string,
+    reason = "Terminated by manager",
+    opts?: { callerAgentId?: string | null },
+  ) {
+    const run = await getRun(runId);
+    if (!run) throw notFound("Heartbeat run not found");
+    // Idempotent: already in a terminal state, return as-is.
+    if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
+    const agent = await getAgent(run.agentId);
+
+    const running = runningProcesses.get(run.id);
+    if (running) {
+      await terminateHeartbeatRunProcess({
+        pid: running.child.pid ?? run.processPid,
+        processGroupId: running.processGroupId ?? run.processGroupId,
+        graceMs: Math.max(1, running.graceSec) * 1000,
+      });
+    } else if (run.processPid || run.processGroupId) {
+      await terminateHeartbeatRunProcess({
+        pid: run.processPid,
+        processGroupId: run.processGroupId,
+      });
+    }
+
+    const now = new Date();
+    const terminated = await setRunStatus(run.id, "failed", {
+      finishedAt: now,
+      error: reason,
+      errorCode: "terminated_by_manager",
+      ...(agent ? {
+        resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
+          resultJson: parseObject(run.resultJson),
+          errorCode: "terminated_by_manager",
+          errorMessage: reason,
+        }),
+      } : {}),
+    });
+
+    await setWakeupStatus(run.wakeupRequestId, "failed", {
+      finishedAt: now,
+      error: reason,
+    });
+
+    if (terminated) {
+      await appendRunEvent(terminated, await nextRunEventSeq(terminated.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "run terminated by manager",
+        payload: {
+          reason,
+          ...(opts?.callerAgentId ? { callerAgentId: opts.callerAgentId } : {}),
+        },
+      });
+      await releaseEnvironmentLeasesForRun({
+        runId: terminated.id,
+        companyId: terminated.companyId,
+        agentId: terminated.agentId,
+        status: terminated.status,
+        failureReason: terminated.error ?? undefined,
+      });
+      await releaseIssueExecutionAndPromote(terminated);
+    }
+
+    runningProcesses.delete(run.id);
+    await finalizeAgentStatus(run.agentId, "failed");
+    await startNextQueuedRunForAgent(run.agentId);
+    return terminated;
+  }
+
   async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause") {
     const agent = await getAgent(agentId);
     const runs = await db
@@ -7808,6 +7894,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
+
+    terminateRun: (
+      runId: string,
+      reason?: string,
+      opts?: { callerAgentId?: string | null },
+    ) => terminateRunInternal(runId, reason, opts),
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 

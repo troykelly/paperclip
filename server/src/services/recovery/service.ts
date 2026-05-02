@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
+import { isPidAlive, isProcessGroupAlive } from "../local-service-supervisor.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -295,7 +296,13 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    terminateConfirmedDeadRun?: (runId: string, reason: string) => Promise<unknown>;
+  },
+) {
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
@@ -927,6 +934,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return true;
   }
 
+  // Returns true when process death is confirmed: pid absent OR pid alive but its process
+  // group is gone (classic pid-reuse case where the original process died and the pid was
+  // recycled by an unrelated process). Returns false when the process appears genuinely alive
+  // or when there is no pid information to check against.
+  function isRunProcessConfirmedDead(run: typeof heartbeatRuns.$inferSelect): boolean {
+    const pid = run.processPid;
+    const pgid = run.processGroupId;
+    if (!pid && !pgid) return false;
+    if (pid && !isPidAlive(pid)) return true;
+    if (pid && pgid) {
+      // Pid alive but group gone → pid was reused by a different process.
+      if (isPidAlive(pid) && !isProcessGroupAlive(pgid)) return true;
+      return false; // Both alive — genuinely alive (ambiguous, may be legitimately silent)
+    }
+    if (!pid && pgid) return !isProcessGroupAlive(pgid);
+    return false;
+  }
+
   async function createOrUpdateStaleRunEvaluation(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -943,6 +968,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       now: input.now,
     });
     const level = (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS ? "critical" : "suspicious";
+
+    // At critical level, check whether the process is confirmed dead. If so, auto-terminate
+    // the run and skip creating a review issue — human review is reserved for ambiguous cases
+    // where the process appears alive but has produced no output.
+    if (level === "critical" && deps.terminateConfirmedDeadRun && isRunProcessConfirmedDead(input.run)) {
+      const autoTermReason = `Watchdog auto-terminate: process death confirmed after ${formatDuration(evidence.silenceAgeMs)} of output silence`;
+      await deps.terminateConfirmedDeadRun(input.run.id, autoTermReason);
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: input.run.id,
+        action: "heartbeat.watchdog_auto_terminated",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          reason: autoTermReason,
+          silenceAgeMs: evidence.silenceAgeMs,
+          processPid: input.run.processPid,
+          processGroupId: input.run.processGroupId,
+        },
+      });
+      return { kind: "auto_terminated" as const, runId: input.run.id };
+    }
+
     const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {
@@ -1077,6 +1129,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       created: 0,
       existing: 0,
       escalated: 0,
+      autoTerminated: 0,
       snoozed: 0,
       skipped: 0,
       evaluationIssueIds: [] as string[],
@@ -1091,6 +1144,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
+      else if (outcome.kind === "auto_terminated") result.autoTerminated += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);
